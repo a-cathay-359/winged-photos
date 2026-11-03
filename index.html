@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>纯原生图片裁剪 / 压缩 / 降分辨率</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; display: grid; gap: 12px; }
+  #stage { border: 1px dashed #8886; border-radius: 8px; min-height: 120px;
+           display: grid; place-items: center; padding: 8px; }
+  #cv { max-width: 100%; display: block; touch-action: none; cursor: crosshair; }
+  .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  label { display: flex; gap: 6px; align-items: center; }
+  input[type=range] { width: 150px; }
+  input[type=number] { width: 88px; }
+  button { padding: 8px 16px; border-radius: 6px; border: 1px solid #8886;
+           background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #info { font-family: ui-monospace, monospace; color: #6b7280; white-space: pre-wrap; }
+  #preview img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <input type="file" id="file" accept="image/*">
+
+  <div id="stage"><canvas id="cv"></canvas></div>
+
+  <div class="row">
+    <label>质量 <input type="range" id="quality" min="0.1" max="1" step="0.01" value="0.8"><span id="qv">0.80</span></label>
+    <label>最大边长 <input type="number" id="maxSide" min="16" step="1" value="1600"> px</label>
+    <label>格式
+      <select id="format">
+        <option value="image/jpeg">JPEG</option>
+        <option value="image/webp">WebP</option>
+        <option value="image/png">PNG</option>
+      </select>
+    </label>
+    <button id="go" disabled>导出并下载</button>
+  </div>
+
+  <div id="info">请选择一张图片，然后在图上拖拽框选裁剪区域。</div>
+  <div id="preview"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const fileEl   = $('#file'),   cv      = $('#cv'),     stage   = $('#stage');
+const qualityEl= $('#quality'), qv     = $('#qv'),     maxSideEl = $('#maxSide');
+const formatEl = $('#format'), goBtn  = $('#go');
+const info     = $('#info'),   preview = $('#preview');
+
+let img = null;        // ImageBitmap | HTMLImageElement
+let fileSize = 0;
+let sel = null;        // 裁剪区，原图坐标系 {x,y,w,h}
+let scale = 1;         // 原图像素 -> canvas 像素
+let dragStart = null;
+
+const dpr = () => window.devicePixelRatio || 1;
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+/* ---------- 1. 解码 ---------- */
+async function loadImage(file) {
+  // createImageBitmap 更快，且能按 EXIF 自动转正
+  if ('createImageBitmap' in window) {
+    try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch (e) {}
+    try { return await createImageBitmap(file); } catch (e) {}
+  }
+  return await new Promise((res, rej) => {
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload  = () => { URL.revokeObjectURL(url); res(im); };
+    im.onerror = () => { URL.revokeObjectURL(url); rej(new Error('无法解码图片')); };
+    im.src = url;
+  });
+}
+
+/* ---------- 2. 显示与绘制 ---------- */
+function layout() {
+  if (!img) return;
+  const availW = Math.max(120, stage.clientWidth - 16);
+  const availH = Math.max(120, window.innerHeight * 0.6);
+  const r = Math.min(1, availW / img.width, availH / img.height);
+
+  const cssW = Math.round(img.width * r);
+  const cssH = Math.round(img.height * r);
+  const d = dpr();
+  cv.style.width  = cssW + 'px';
+  cv.style.height = cssH + 'px';
+  cv.width  = Math.round(cssW * d);
+  cv.height = Math.round(cssH * d);
+
+  scale = cv.width / img.width;   // 原图坐标 -> canvas 像素
+  draw();
+}
+
+function draw() {
+  if (!img) return;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(img, 0, 0, cv.width, cv.height);
+  if (!sel) return;
+
+  const x = sel.x * scale, y = sel.y * scale, w = sel.w * scale, h = sel.h * scale;
+
+  // 半透明遮罩，中间挖空
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,.55)';
+  ctx.beginPath();
+  ctx.rect(0, 0, cv.width, cv.height);
+  ctx.rect(x, y, w, h);
+  ctx.fill('evenodd');
+
+  // 选框 + 三分线
+  ctx.lineWidth = Math.max(1, 2 * dpr());
+  ctx.strokeStyle = '#fff';
+  ctx.strokeRect(x, y, w, h);
+  ctx.globalAlpha = 0.5;
+  ctx.beginPath();
+  for (let i = 1; i < 3; i++) {
+    ctx.moveTo(x + w * i / 3, y); ctx.lineTo(x + w * i / 3, y + h);
+    ctx.moveTo(x, y + h * i / 3); ctx.lineTo(x + w, y + h * i / 3);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- 3. 框选交互 ---------- */
+function toImg(e) {
+  const r = cv.getBoundingClientRect();
+  const px = (e.clientX - r.left) * (cv.width  / r.width);
+  const py = (e.clientY - r.top ) * (cv.height / r.height);
+  return { x: clamp(px / scale, 0, img.width), y: clamp(py / scale, 0, img.height) };
+}
+
+cv.addEventListener('pointerdown', e => {
+  if (!img) return;
+  cv.setPointerCapture(e.pointerId);
+  dragStart = toImg(e);
+  sel = { x: dragStart.x, y: dragStart.y, w: 0, h: 0 };
+  draw();
+});
+
+cv.addEventListener('pointermove', e => {
+  if (!dragStart) return;
+  const p = toImg(e);
+  sel = {
+    x: Math.min(dragStart.x, p.x),
+    y: Math.min(dragStart.y, p.y),
+    w: Math.abs(p.x - dragStart.x),
+    h: Math.abs(p.y - dragStart.y),
+  };
+  draw();
+});
+
+cv.addEventListener('pointerup', e => {
+  if (!dragStart) return;
+  dragStart = null;
+  if (!sel || sel.w < 2 || sel.h < 2) sel = { x: 0, y: 0, w: img.width, h: img.height };
+  draw();
+  info.textContent = `裁剪区：${Math.round(sel.w)}×${Math.round(sel.h)}（原图 ${img.width}×${img.height}）`;
+});
+
+/* ---------- 4. 导出：裁剪 + 缩放 + 压缩 ---------- */
+async function doExport() {
+  if (!img || !sel) return;
+  const fmt = formatEl.value;
+  const q   = +qualityEl.value;
+  const maxSide = Math.max(1, +maxSideEl.value || Math.max(sel.w, sel.h));
+
+  // 降分辨率：按长边等比缩放
+  const k  = Math.min(1, maxSide / Math.max(sel.w, sel.h));
+  const ow = Math.max(1, Math.round(sel.w * k));
+  const oh = Math.max(1, Math.round(sel.h * k));
+
+  const out = document.createElement('canvas');
+  out.width = ow;
+  out.height = oh;
+  const ctx = out.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  if (fmt === 'image/jpeg') {       // JPEG 无透明通道，先铺白底
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, ow, oh);
+  }
+
+  // 源矩形 -> 目标矩形：一次完成裁切 + 缩放
+  ctx.drawImage(img, sel.x, sel.y, sel.w, sel.h, 0, 0, ow, oh);
+
+  const blob = await new Promise(res => out.toBlob(res, fmt, q));
+  if (!blob) { info.textContent = '导出失败：浏览器可能不支持该格式'; return; }
+
+  // 下载
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `output.${fmt === 'image/jpeg' ? 'jpg' : fmt.split('/')[1]}`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 15000);
+
+  // 预览 + 体积对比
+  const oldUrl = preview.querySelector('img')?.src;
+  if (oldUrl) URL.revokeObjectURL(oldUrl);
+  preview.innerHTML = '';
+  const pim = new Image();
+  pim.src = url;
+  preview.appendChild(pim);
+
+  info.textContent =
+    `输出：${ow}×${oh}   ${(blob.size / 1024).toFixed(1)} KB\n` +
+    `原图：${img.width}×${img.height}   ${(fileSize / 1024).toFixed(1)} KB\n` +
+    `压缩率：${(100 - blob.size / fileSize * 100).toFixed(1)}%`;
+}
+
+/* ---------- 5. 事件绑定 ---------- */
+fileEl.addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  info.textContent = '解码中…';
+  try {
+    img = await loadImage(f);
+    fileSize = f.size;
+    sel = { x: 0, y: 0, w: img.width, h: img.height };
+    layout();
+    goBtn.disabled = false;
+    info.textContent = `原图 ${img.width}×${img.height}，${(f.size / 1024).toFixed(1)} KB。在图上拖拽可框选裁剪区。`;
+  } catch (err) {
+    info.textContent = '加载失败：' + err.message;
+  }
+});
+
+qualityEl.addEventListener('input', () => qv.textContent = (+qualityEl.value).toFixed(2));
+formatEl.addEventListener('change', () => {
+  const isPng = formatEl.value === 'image/png';
+  qualityEl.disabled = isPng;                     // PNG 无质量参数
+  qv.textContent = isPng ? '—' : (+qualityEl.value).toFixed(2);
+});
+goBtn.addEventListener('click', doExport);
+window.addEventListener('resize', layout);
+</script>
+</body>
+</html>
